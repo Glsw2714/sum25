@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""
+A script that prepares data and trains a separate MLP model for each beam energy,
+reading from distinct directories for train, validation, and test sets.
+"""
+
+import os
+import sys
+import time
+import glob
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import tensorboard
+from alive_progress import alive_bar
+
+# ==============================================================================
+# 1. CONFIGURATION
+# ==============================================================================
+
+# --- PLEASE SET THESE DIRECTORY PATHS ---
+# The script assumes your data is pre-split into these folders.
+TRAIN_DATA_DIR = "/scratch/gregory/allcsv2/training"
+VAL_DATA_DIR = "/scratch/gregory/allcsv2/validation"
+TEST_DATA_DIR = "/scratch/gregory/allcsv2/test"
+BASE_OUTPUT_DIR = "./model_runs"
+
+# --- Data and Model Definitions ---
+VARIABLES_TO_EXTRACT = ['x', 'q2']
+METHODS_TO_EXTRACT = ['da', 'electron', 'jb', 'esigma', 'sigma']
+TRUTH_VAR_MAPPING = {'x': 'xbj', 'q2': 'q2'}
+BEAM_ENERGIES = ['5x41', '10x100', '18x275']
+
+# --- Hyperparameters ---
+NUM_EPOCHS = 100
+BATCH_SIZE = 1024
+LEARNING_RATE = 1e-3
+NUM_WORKERS = 4
+
+
+# ==============================================================================
+# 2. HELPER FUNCTIONS AND CLASS DEFINITIONS
+# ==============================================================================
+
+def concat_csvs_unique_event(pattern, key_column='evt'):
+    """
+    Read all CSV files matching the naming pattern and ensure unique event IDs.
+    """
+    dfs = []
+    offset = 0
+    files_found = sorted(glob.glob(pattern))
+    if not files_found:
+        print(f"No files found matching pattern: {pattern}")
+        return pd.DataFrame()
+    for file in files_found:
+        try:
+            df = pd.read_csv(file)
+            df.columns = [col.strip().strip(',') for col in df.columns]
+            if df.empty:
+                continue
+            if key_column not in df.columns:
+                continue
+            df[key_column] = pd.to_numeric(df[key_column], errors="coerce")
+            df[key_column] += offset
+            max_evt = df[key_column].max()
+            if pd.notna(max_evt):
+                offset = int(max_evt) + 1
+            dfs.append(df)
+        except Exception as e:
+            print(f"Error reading {file}: {e}")
+    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+
+class MLP(torch.nn.Module):
+    """
+    A simple Multi-Layer Perceptron model.
+    """
+    def __init__(self, input_size=10, output_size=2):
+        super().__init__()
+        self.layers = torch.nn.Sequential(
+            torch.nn.Linear(input_size, 64),
+            torch.nn.ReLU(),
+            torch.nn.Linear(64, 128),
+            torch.nn.ReLU(),
+            torch.nn.Linear(128, 64),
+            torch.nn.ReLU(),
+            torch.nn.Linear(64, 32),
+            torch.nn.ReLU(),
+            torch.nn.Linear(32, output_size)
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
+def prepare_tensors_for_set(data_dir, beam_energy, variables, methods, truth_mapping):
+    """
+    Loads data for a specific beam energy from a specific directory (train, val, or test).
+    """
+    print(f"  Loading data for '{beam_energy}' from '{data_dir}'...")
+    mc_dis_path = os.path.join(data_dir, f"*{beam_energy}*mc_dis.csv")
+    reco_path = os.path.join(data_dir, f"*{beam_energy}*reco_dis.csv")
+    
+    mc_dis_df = concat_csvs_unique_event(mc_dis_path, key_column='evt')
+    reco_df   = concat_csvs_unique_event(reco_path, key_column='evt')
+    
+    if mc_dis_df.empty:
+        print(f"    Warning: Truth dataframe is empty for this set. Returning empty tensors.")
+        return np.array([]), np.array([])
+    
+    merged_df = pd.merge(mc_dis_df, reco_df, on='evt', how='left')
+    num_events = len(merged_df)
+    if num_events == 0:
+        return np.array([]), np.array([])
+
+    reco_tensor = np.zeros((len(variables), len(methods), num_events))
+    truth_tensor = np.zeros((len(variables), 1, num_events))
+
+    for i, var_key in enumerate(variables):
+        truth_col_name = truth_mapping.get(var_key)
+        if truth_col_name and truth_col_name in merged_df.columns:
+            truth_tensor[i, 0, :] = merged_df[truth_col_name].fillna(0).to_numpy()
+        
+        for j, method in enumerate(methods):
+            reco_col_name = f"{method}_{var_key}"
+            if reco_col_name in merged_df.columns:
+                reco_tensor[i, j, :] = merged_df[reco_col_name].fillna(0).to_numpy()
+            
+    # Reshape for PyTorch: (vars, methods, events) -> (events, vars, methods)
+    reco_tensor = np.transpose(reco_tensor, (2, 0, 1))
+    truth_tensor = np.transpose(truth_tensor, (2, 0, 1))
+    
+    print(f"    Loaded {num_events} events.")
+    return reco_tensor, truth_tensor
+
+# ==============================================================================
+# 3. MAIN EXECUTION SCRIPT
+# ==============================================================================
+
+if __name__ == "__main__":
+    # This main loop will run the entire pipeline for each beam energy separately.
+    for beam_energy in BEAM_ENERGIES:
+        print(f"STARTING PIPELINE FOR BEAM ENERGY: {beam_energy}")
+
+        # --- 1. Data Preparation for this Beam Energy ---
+        train_inputs, train_truths = prepare_tensors_for_set(
+            TRAIN_DATA_DIR, beam_energy, VARIABLES_TO_EXTRACT, METHODS_TO_EXTRACT, TRUTH_VAR_MAPPING
+        )
+        val_inputs, val_truths = prepare_tensors_for_set(
+            VAL_DATA_DIR, beam_energy, VARIABLES_TO_EXTRACT, METHODS_TO_EXTRACT, TRUTH_VAR_MAPPING
+        )
+        # You can optionally load a test set here for final evaluation after training
+        # test_inputs, test_truths = prepare_tensors_for_set(...)
+        
+        if len(train_inputs) == 0 or len(val_inputs) == 0:
+            print(f"Cannot proceed with training for {beam_energy} due to missing train/validation data.")
+            continue
+
+        # --- 2. PyTorch Setup for this Beam Energy ---
+        print(f"\n  Setting up PyTorch components for {beam_energy}...")
+        
+        output_dir = os.path.join(BASE_OUTPUT_DIR, beam_energy, f"run_{time.strftime('%Y%m%d_%H%M%S')}")
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"  Model and plots will be saved in: {output_dir}")
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Initialize a fresh model for each beam energy
+        model = MLP(input_size=len(VARIABLES_TO_EXTRACT) * len(METHODS_TO_EXTRACT), 
+                    output_size=len(VARIABLES_TO_EXTRACT)).to(device)
+        
+        criterion = torch.nn.MSELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+        lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.2)
+        
+        # Create Datasets and DataLoaders
+        train_dataset = torch.utils.data.TensorDataset(torch.from_numpy(train_inputs).float(), torch.from_numpy(train_truths).float())
+        val_dataset = torch.utils.data.TensorDataset(torch.from_numpy(val_inputs).float(), torch.from_numpy(val_truths).float())
+        
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
+        val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+
+        # --- 3. Training Loop for this Beam Energy ---
+        print(f"\n  Starting model training for {beam_energy}...")
+        train_losses, val_losses = [], []
+
+        for epoch in range(NUM_EPOCHS):
+            print(f"  Epoch {epoch+1}/{NUM_EPOCHS}")
+            model.train()
+            running_loss = 0.0
+            with alive_bar(len(train_loader), force_tty=True, title=f'Epoch {epoch+1} Train') as bar:
+                for inputs, truths in train_loader:
+                    inputs, truths = inputs.to(device, non_blocking=True), truths.to(device, non_blocking=True)
+                    inputs, truths = inputs.view(inputs.size(0), -1), truths.view(truths.size(0), -1)
+                    
+                    optimizer.zero_grad()
+                    outputs = model(inputs)
+                    loss = criterion(outputs, truths)
+                    loss.backward()
+                    optimizer.step()
+                    running_loss += loss.item()
+                    bar()
+            
+            avg_train_loss = running_loss / len(train_loader)
+            train_losses.append(avg_train_loss)
+            
+            # Validation
+            model.eval()
+            val_running_loss = 0.0
+            with torch.no_grad():
+                for inputs, truths in val_loader:
+                    inputs, truths = inputs.to(device, non_blocking=True), truths.to(device, non_blocking=True)
+                    inputs, truths = inputs.view(inputs.size(0), -1), truths.view(truths.size(0), -1)
+                    outputs = model(inputs)
+                    val_running_loss += criterion(outputs, truths).item()
+            
+            avg_val_loss = val_running_loss / len(val_loader)
+            val_losses.append(avg_val_loss)
+            
+            print(f"    Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
+            lr_scheduler.step()
+
+        print(f"\n  Training complete for {beam_energy}.")
+
+        # --- 4. Save Results for this Beam Energy ---
+        torch.save(model.state_dict(), os.path.join(output_dir, "model.pth"))
+        print(f"  Model for {beam_energy} saved to {output_dir}/model.pth")
+
+        plt.figure(figsize=(10, 5))
+        plt.plot(train_losses, label='Train Loss')
+        plt.plot(val_losses, label='Validation Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title(f'Training and Validation Loss for {beam_energy}')
+        plt.legend()
+        plt.savefig(os.path.join(output_dir, "loss_plot.png"))
+        print(f"  Loss plot for {beam_energy} saved to {output_dir}/loss_plot.png")
+
+
